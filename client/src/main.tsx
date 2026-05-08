@@ -1,5 +1,5 @@
 import { StrictMode } from "react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -57,6 +57,14 @@ function compactJson(value: unknown) {
   return text.length > 900 ? `${text.slice(0, 900)}\n...` : text;
 }
 
+function stripThinking(content: string) {
+  return content
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/^[\s\S]*?<\/think>/i, "")
+    .replace(/<think>[\s\S]*$/i, "")
+    .trim();
+}
+
 function ToolTracePanel({ traces }: { traces: ToolTrace[] }) {
   if (traces.length === 0) {
     return null;
@@ -105,6 +113,11 @@ function App() {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages, isLoading, error]);
 
   const visibleConversation = messages
     .filter((message) => message.role === "user" || message.role === "assistant")
@@ -155,7 +168,7 @@ function App() {
         {
           id: crypto.randomUUID(),
           role: "assistant",
-          content: assistantPayload.content,
+          content: stripThinking(assistantPayload.content),
           toolTrace: assistantPayload.toolTrace
         }
       ]);
@@ -225,12 +238,17 @@ function App() {
               <div className="avatar" aria-hidden="true">
                 <Bot size={18} />
               </div>
-              <div className="bubble loading-bubble">
-                <Loader2 className="spin" size={18} />
-                <span>Researching with local model and tools...</span>
+              <div className="bubble thinking-bubble" aria-live="polite">
+                <span>Thinking</span>
+                <span className="thinking-dots" aria-hidden="true">
+                  <span />
+                  <span />
+                  <span />
+                </span>
               </div>
             </article>
           ) : null}
+          <div ref={messagesEndRef} />
         </div>
 
         {error ? (

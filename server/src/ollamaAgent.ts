@@ -45,10 +45,19 @@ const systemPrompt = [
   "Do not invent live prices. If a price or coin is current, use a tool.",
   "When users give a ticker or fuzzy name, search first unless the CoinGecko ID is obvious.",
   "Keep answers concise, cite whether data came from CoinGecko or Binance, and include timestamps when available.",
+  "Return only the final answer. Never include hidden reasoning, chain-of-thought, or <think> tags.",
   "This is research only, not financial advice. Do not recommend trades or promise returns."
 ].join(" ");
 
 const MAX_TOOL_ROUNDS = 5;
+
+function stripThinking(content: string) {
+  return content
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/^[\s\S]*?<\/think>/i, "")
+    .replace(/<think>[\s\S]*$/i, "")
+    .trim();
+}
 
 function toOllamaMessages(messages: PublicChatMessage[]): OllamaMessage[] {
   return [
@@ -94,10 +103,11 @@ export async function runCryptoAgent(input: z.infer<typeof chatRequestSchema>) {
     const response = await callOllama(model, messages);
     const assistantMessage = response.message;
     const toolCalls = assistantMessage.tool_calls ?? [];
+    const assistantContent = stripThinking(assistantMessage.content ?? "");
 
     messages.push({
       role: "assistant",
-      content: assistantMessage.content ?? "",
+      content: assistantContent,
       tool_calls: toolCalls
     });
 
@@ -105,7 +115,7 @@ export async function runCryptoAgent(input: z.infer<typeof chatRequestSchema>) {
       return {
         role: "assistant" as const,
         content:
-          assistantMessage.content?.trim() ||
+          assistantContent ||
           "I could not produce a useful answer from the available local model response.",
         model,
         toolTrace
