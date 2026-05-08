@@ -3,7 +3,12 @@ import rateLimit from "@fastify/rate-limit";
 import Fastify from "fastify";
 import { ZodError } from "zod";
 import { config } from "./config.js";
-import { chatRequestSchema, runCryptoAgent } from "./ollamaAgent.js";
+import {
+  chatRequestSchema,
+  runCryptoAgentStream,
+  warmupOllama,
+  type AgentEvent
+} from "./ollamaAgent.js";
 
 const app = Fastify({
   logger: true,
@@ -26,9 +31,9 @@ app.get("/api/health", async () => ({
 }));
 
 app.post("/api/chat", async (request, reply) => {
+  let body: ReturnType<typeof chatRequestSchema.parse>;
   try {
-    const body = chatRequestSchema.parse(request.body);
-    return await runCryptoAgent(body);
+    body = chatRequestSchema.parse(request.body);
   } catch (error) {
     if (error instanceof ZodError) {
       return reply.status(400).send({
@@ -39,27 +44,53 @@ app.post("/api/chat", async (request, reply) => {
         }))
       });
     }
+    throw error;
+  }
 
+  reply.raw.setHeader("content-type", "application/x-ndjson");
+  reply.raw.setHeader("cache-control", "no-cache, no-transform");
+  reply.raw.setHeader("connection", "keep-alive");
+  reply.raw.setHeader("x-accel-buffering", "no");
+  reply.hijack();
+  reply.raw.flushHeaders?.();
+
+  const writeEvent = (event: AgentEvent) => {
+    if (reply.raw.writableEnded) return;
+    reply.raw.write(`${JSON.stringify(event)}\n`);
+  };
+
+  const onClose = () => {
+    request.log.warn("client disconnected before chat completed");
+  };
+  reply.raw.once("close", onClose);
+
+  try {
+    for await (const event of runCryptoAgentStream(body)) {
+      writeEvent(event);
+      if (event.type === "error" || event.type === "done") {
+        break;
+      }
+    }
+  } catch (error) {
     request.log.error(error);
-
     const message = error instanceof Error ? error.message : "Unexpected server error";
-    const isOllamaConnectionIssue =
-      message.includes("ECONNREFUSED") || message.includes("fetch failed");
-    const isMissingOllamaModel = message.includes("model '") && message.includes("not found");
-
-    return reply.status(isOllamaConnectionIssue || isMissingOllamaModel ? 503 : 500).send({
-      error: isMissingOllamaModel
-        ? "Ollama model not found. Pull the configured model or set OLLAMA_MODEL in .env."
-        : isOllamaConnectionIssue
-        ? "Could not reach Ollama. Make sure Ollama is running and the model is pulled."
-        : "Chat request failed",
-      details: message
-    });
+    writeEvent({ type: "error", message, kind: "unknown" });
+  } finally {
+    reply.raw.off("close", onClose);
+    if (!reply.raw.writableEnded) {
+      reply.raw.end();
+    }
   }
 });
 
 try {
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
+  void warmupOllama()
+    .then(() => app.log.info({ model: config.OLLAMA_MODEL }, "ollama warmup complete"))
+    .catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      app.log.warn({ err: message }, "ollama warmup failed (the first chat will pay the cold-start cost)");
+    });
 } catch (error) {
   app.log.error(error);
   process.exit(1);

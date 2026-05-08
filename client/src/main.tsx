@@ -29,13 +29,6 @@ type ToolTrace = {
   result: unknown;
 };
 
-type ChatResponse = {
-  role: "assistant";
-  content: string;
-  model: string;
-  toolTrace: ToolTrace[];
-};
-
 const examples = [
   "What is the current price of bitcoin and ethereum?",
   "Find coins related to solana and show the top matches.",
@@ -65,6 +58,19 @@ function stripThinking(content: string) {
     .trim();
 }
 
+function friendlyErrorMessage(raw: string, kind?: string) {
+  if (kind === "ollama_unreachable") {
+    return "Could not reach Ollama. Make sure `ollama serve` is running on the configured port.";
+  }
+  if (kind === "ollama_model_missing") {
+    return "Ollama model not found. Pull the configured model (e.g. `ollama pull qwen3:4b`) or set OLLAMA_MODEL in .env.";
+  }
+  if (kind === "timeout") {
+    return "The local model went idle for too long. Try a shorter question or a smaller model (e.g. qwen2.5:3b).";
+  }
+  return raw;
+}
+
 function ToolTracePanel({ traces }: { traces: ToolTrace[] }) {
   if (traces.length === 0) {
     return null;
@@ -91,17 +97,29 @@ function ToolTracePanel({ traces }: { traces: ToolTrace[] }) {
   );
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function MessageBubble({ message, pending }: { message: ChatMessage; pending?: boolean }) {
   const isUser = message.role === "user";
   const Icon = isUser ? User : Bot;
+  const showThinkingDots = pending && !message.content;
 
   return (
     <article className={`message ${isUser ? "message-user" : "message-assistant"}`}>
       <div className="avatar" aria-hidden="true">
         <Icon size={18} />
       </div>
-      <div className="bubble">
-        <p>{message.content}</p>
+      <div className={`bubble ${showThinkingDots ? "thinking-bubble" : ""}`}>
+        {showThinkingDots ? (
+          <>
+            <span>Thinking</span>
+            <span className="thinking-dots" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+          </>
+        ) : (
+          <p>{message.content}</p>
+        )}
         <ToolTracePanel traces={message.toolTrace ?? []} />
       </div>
     </article>
@@ -135,46 +153,115 @@ function App() {
       role: "user",
       content
     };
+    const assistantId = crypto.randomUUID();
 
     setInput("");
     setError(null);
     setIsLoading(true);
-    setMessages((current) => [...current, userMessage]);
+    setMessages((current) => [
+      ...current,
+      userMessage,
+      { id: assistantId, role: "assistant", content: "", toolTrace: [] }
+    ]);
+
+    let assistantBuffer = "";
+    let assistantTraces: ToolTrace[] = [];
+
+    const updateAssistant = (next: Partial<ChatMessage>) => {
+      setMessages((current) =>
+        current.map((message) => (message.id === assistantId ? { ...message, ...next } : message))
+      );
+    };
 
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: {
-          "content-type": "application/json"
+          "content-type": "application/json",
+          accept: "application/x-ndjson"
         },
         body: JSON.stringify({
           messages: [...visibleConversation, userMessage].slice(-16)
         })
       });
 
-      const payload = (await response.json()) as ChatResponse | { error: string; details?: string };
-
       if (!response.ok) {
-        if ("error" in payload) {
-          throw new Error(payload.details ? `${payload.error}: ${payload.details}` : payload.error);
+        let errorText = `Request failed (${response.status})`;
+        try {
+          const payload = (await response.json()) as { error?: string; details?: unknown };
+          if (payload?.error) {
+            errorText = typeof payload.details === "string"
+              ? `${payload.error}: ${payload.details}`
+              : payload.error;
+          }
+        } catch {
+          // body wasn't JSON
         }
-
-        throw new Error("Request failed");
+        throw new Error(errorText);
       }
 
-      const assistantPayload = payload as ChatResponse;
-      setMessages((current) => [
-        ...current,
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: stripThinking(assistantPayload.content),
-          toolTrace: assistantPayload.toolTrace
+      if (!response.body) {
+        throw new Error("Server returned an empty response");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let streamError: string | null = null;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let newlineIndex = buffer.indexOf("\n");
+        while (newlineIndex !== -1) {
+          const line = buffer.slice(0, newlineIndex).trim();
+          buffer = buffer.slice(newlineIndex + 1);
+          if (line) {
+            try {
+              const event = JSON.parse(line) as
+                | { type: "delta"; content: string }
+                | { type: "tool"; trace: ToolTrace }
+                | { type: "done"; content: string; model: string; toolTrace: ToolTrace[] }
+                | { type: "error"; message: string; kind?: string };
+
+              if (event.type === "delta") {
+                assistantBuffer += event.content;
+                updateAssistant({ content: stripThinking(assistantBuffer) });
+              } else if (event.type === "tool") {
+                assistantTraces = [...assistantTraces, event.trace];
+                updateAssistant({ toolTrace: assistantTraces });
+              } else if (event.type === "done") {
+                assistantBuffer = event.content;
+                assistantTraces = event.toolTrace ?? assistantTraces;
+                updateAssistant({
+                  content: stripThinking(event.content),
+                  toolTrace: assistantTraces
+                });
+              } else if (event.type === "error") {
+                streamError = friendlyErrorMessage(event.message, event.kind);
+              }
+            } catch {
+              // skip malformed line
+            }
+          }
+          newlineIndex = buffer.indexOf("\n");
         }
-      ]);
+      }
+
+      if (streamError) {
+        throw new Error(streamError);
+      }
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "Something went wrong.";
       setError(message);
+      setMessages((current) => {
+        const target = current.find((m) => m.id === assistantId);
+        if (target && !target.content) {
+          return current.filter((m) => m.id !== assistantId);
+        }
+        return current;
+      });
     } finally {
       setIsLoading(false);
     }
@@ -229,25 +316,16 @@ function App() {
 
       <section className="chat-panel" aria-label="Crypto chat">
         <div className="messages">
-          {messages.map((message) => (
-            <MessageBubble key={message.id} message={message} />
-          ))}
-
-          {isLoading ? (
-            <article className="message message-assistant">
-              <div className="avatar" aria-hidden="true">
-                <Bot size={18} />
-              </div>
-              <div className="bubble thinking-bubble" aria-live="polite">
-                <span>Thinking</span>
-                <span className="thinking-dots" aria-hidden="true">
-                  <span />
-                  <span />
-                  <span />
-                </span>
-              </div>
-            </article>
-          ) : null}
+          {messages.map((message, index) => {
+            const isLast = index === messages.length - 1;
+            return (
+              <MessageBubble
+                key={message.id}
+                message={message}
+                pending={isLoading && isLast && message.role === "assistant"}
+              />
+            );
+          })}
           <div ref={messagesEndRef} />
         </div>
 
