@@ -1,5 +1,7 @@
 # Crypto AI Research
 
+<img width="1252" height="914" alt="image" src="https://github.com/user-attachments/assets/bed6a2d3-048c-45d9-8beb-c6c65608b988" />  
+
 A small Vite + React + TypeScript app with a Node/Fastify backend that lets a local Ollama model call allowlisted crypto research tools.
 
 > **Learning project.** The point is to see, end to end, how an LLM can decide *when* to call a function, how the host program executes it, and how the result feeds back into the next model turn — all using a free local model, no paid API keys required.
@@ -94,6 +96,14 @@ ollama pull qwen3:4b
 Or as you wish (as long as your pc can handle it)
 
 ## Setup
+
+```sh
+npm install
+cp .env.example .env
+npm run dev
+```
+
+Or 
 
 ```sh
 bun install
