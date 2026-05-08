@@ -82,8 +82,16 @@ Each tool has both a **JSON Schema** (sent to the model so it knows what argumen
 - The model pulled locally:
 
 ```sh
+ollama pull qwen2.5:3b
+```
+
+Or 
+
+```sh
 ollama pull qwen3:4b
 ```
+
+Or as you wish (as long as your pc can handle it)
 
 ## Setup
 
